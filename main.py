@@ -8,8 +8,6 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 # pyrefly: ignore [missing-import]
 from langgraph.graph import StateGraph, END
-# pyrefly: ignore [missing-import]
-from mangum import Mangum
 
 # Initialize FastAPI app
 app = FastAPI(title="CliniAgent - Multi-Agent Clinical RAG API", version="1.0")
@@ -38,26 +36,29 @@ class AgentState(TypedDict):
     structured_output: dict
     error: str
 
-# Initialize Gemini Model
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.1)
+# Helper to get LLM instance lazily so top-level imports don't throw error on startup
+def get_llm():
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY is missing from Environment Variables.")
+    return ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.1, google_api_key=api_key)
 
 # -------------------------------------------------------------------------
 # 3. LangGraph Agent Nodes
 # -------------------------------------------------------------------------
 def retrieval_node(state: AgentState):
     """Simulates RAG retrieval by filtering context based on the query."""
-    print("--- NODE: RETRIEVING CONTEXT ---")
     state["retrieved_context"] = state["document_text"]
     return state
 
 def generation_node(state: AgentState):
-    """Generates the clinical analysis using Gemini and Pydantic validation schema."""
-    print("--- NODE: GENERATING CLINICAL INSIGHTS ---")
+    """Generates clinical analysis using Gemini and Pydantic validation schema."""
     prompt = ChatPromptTemplate.from_messages([
         ("system", "You are an expert clinical AI assistant. Analyze the provided text and answer the query accurately."),
         ("human", "Context: {context}\n\nQuestion: {query}")
     ])
     
+    llm = get_llm()
     chain = prompt | llm
     response = chain.invoke({"context": state["retrieved_context"], "query": state["query"]})
     state["raw_answer"] = response.content
@@ -65,7 +66,6 @@ def generation_node(state: AgentState):
 
 def validation_node(state: AgentState):
     """Enforces type-safe structured output using Pydantic parsing."""
-    print("--- NODE: VALIDATING WITH PYDANTIC ---")
     try:
         validated_data = ClinicalResponseSchema(
             clinical_summary=state["raw_answer"][:300],
@@ -73,7 +73,7 @@ def validation_node(state: AgentState):
             key_findings=[state["raw_answer"][:100]],
             safety_checked=True
         )
-        state["structured_output"] = validated_data.dict()
+        state["structured_output"] = validated_data.model_dump()
     except Exception as e:
         state["error"] = str(e)
         state["structured_output"] = {}
@@ -105,7 +105,7 @@ def home():
 @app.post("/analyze", response_model=ClinicalResponseSchema)
 def run_clinical_analysis(payload: QueryRequest):
     if not os.environ.get("GOOGLE_API_KEY"):
-        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY environment variable not configured.")
+        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY environment variable not configured in Vercel.")
     
     initial_state = {
         "query": payload.query,
@@ -123,6 +123,3 @@ def run_clinical_analysis(payload: QueryRequest):
         return final_state["structured_output"]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# Vercel serverless handler adapter
-handler = Mangum(app)
